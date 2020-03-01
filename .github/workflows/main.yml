@@ -1,0 +1,39 @@
+name: PlatformIO
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v1
+      with:
+        submodules: true
+        token: ${{ secrets.GitHub_PAT }}
+    - name: Prepare output directories
+      run: |
+        rm -fdr ${{ github.workspace }}/bin
+        mkdir ${{ github.workspace }}/bin
+    - name: Build
+      run: |
+        docker run \
+        -v ${{ github.workspace }}:/opt/workspace \
+        --workdir /opt/workspace \
+        infinitecoding/platformio-for-ci \
+        /bin/bash -c "platformio run && platformio run --target=buildfs"
+    - name: Upload artifact (Main FW)
+      uses: actions/upload-artifact@v1
+      with:
+        name: fw
+        path: .pio/build/nodemcuv2_com5/firmware.elf
+    - name: Upload artifact (spiffs)
+      uses: actions/upload-artifact@v1
+      with:
+        name: spiffs
+        path: .pio/build/nodemcuv2_com5/spiffs.bin
