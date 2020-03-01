@@ -1,0 +1,6 @@
+[submodule "lib/AdafruitBME280Library"]
+	path = lib/AdafruitBME280Library
+	url = https://github.com/adafruit/Adafruit_BME280_Library.git
+[submodule "lib/AdafruitUnifiedSensorLibrary"]
+	path = lib/AdafruitUnifiedSensorLibrary
+	url = https://github.com/adafruit/Adafruit_Sensor.git
