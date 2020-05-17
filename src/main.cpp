@@ -113,6 +113,7 @@ bool HandleFileRead(String path)
 
 void setupWiFi()
 {
+    WiFi.mode(WIFI_STA);
     WIFI_APS(wifiMulti.addAP);
 
     CONSOLE_LOG_NO_NL("Connecting to WiFi");
