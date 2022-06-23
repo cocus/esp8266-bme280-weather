@@ -1,8 +1,8 @@
 #include <ESP8266WiFi.h>
-#include <ESP8266WiFiMulti.h>
+//#include <ESP8266WiFiMulti.h>
 
 #include <ESP8266WebServer.h>
-#include <FS.h>
+#include <LittleFS.h>
 
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
@@ -11,15 +11,19 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 
+#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
+
+WiFiManager wm; // global wm instance
+WiFiManagerParameter custom_field("otherNodeIP", "Other Node IP", "", 32, "placeholder=\"IP here\""); // global param ( for non blocking w params )
+
 Adafruit_BME280 bme;
 
 ESP8266WebServer server(80);
 
-ESP8266WiFiMulti wifiMulti;
-
 // Blink intervals for normal operation and when an OTA is running (in ms)
 static const unsigned long blink_interval_normal = 1000;
 static const unsigned long blink_interval_ota = 150;
+static const unsigned long blink_interval_ap = 500;
 
 // If the user LED (usually blue) is connected to another GPIO, change the number
 // here:
@@ -28,10 +32,11 @@ static constexpr int BlueLed = 2;
 // string that holds the compile time (used as versioning)
 static const char compile_date[] = __DATE__ " " __TIME__;
 
-// This defines the list of APs where the ESP8266 should connect to when
-// it founds one of them.
-#define WIFI_APS(d) d ("SampleWiFiAp", "SampleWiFiPassword"); \
-                    d ("AnotherWifi Name could go here", "And the password for that AP");
+// Flag that specifies if the weather station http server is running or not
+static bool http_server_running = false;
+
+// File that stores the "otherNodeIP" configuration
+static const char cfg_otherNodeIP[] = "/otherNodeIP.txt";
 
 #define CONSOLE_LOG_NO_NL(fmt, ...) Serial.printf("[%lu] %s(): " fmt, millis(), __FUNCTION__, ## __VA_ARGS__);
 #define CONSOLE_LOG(fmt, ...)       CONSOLE_LOG_NO_NL(fmt "\n", ## __VA_ARGS__);
@@ -71,14 +76,14 @@ String GetContentType(String filename)
 
 void ServeFile(String path)
 {
-    File file = SPIFFS.open(path, "r");
+    File file = LittleFS.open(path, "r");
     server.streamFile(file, GetContentType(path));
     file.close();
 }
 
 void ServeFile(String path, String contentType)
 {
-    File file = SPIFFS.open(path, "r");
+    File file = LittleFS.open(path, "r");
     server.streamFile(file, contentType);
     file.close();
 }
@@ -90,11 +95,11 @@ bool HandleFileRead(String path)
         path += "index.html";
     }
 
-    if (SPIFFS.exists(path))
+    if (LittleFS.exists(path))
     {
         // Log the file name that's being sent and the remote IP
         CONSOLE_LOG(
-            "spiffs:/%s (%s)",
+            "littlefs:/%s (%s)",
             path.c_str(),
             server.client().remoteIP().toString().c_str()
         );
@@ -111,23 +116,117 @@ bool HandleFileRead(String path)
     return false;
 }
 
+/* from https://github.com/tzapu/WiFiManager/blob/master/examples/Parameters/LittleFS/LittleFSParameters.ino */
+String readFile(fs::FS &fs, const char *path)
+{
+    CONSOLE_LOG("Reading file: %s", path);
+    File file = fs.open(path, "r");
+    if (!file || file.isDirectory())
+    {
+        CONSOLE_LOG("- empty file or failed to open file");
+        return String();
+    }
+    String fileContent;
+    while (file.available())
+    {
+        fileContent += String((char)file.read());
+    }
+    file.close();
+    CONSOLE_LOG("- read from file: '%s'", fileContent.c_str());
+    return fileContent;
+}
+void writeFile(fs::FS &fs, const char *path, const char *message)
+{
+    CONSOLE_LOG("Writing file: %s\r\n", path);
+    File file = fs.open(path, "w");
+    if (!file)
+    {
+        CONSOLE_LOG("- failed to open file for writing");
+        return;
+    }
+    if (file.print(message))
+    {
+        CONSOLE_LOG("- file written");
+    }
+    else
+    {
+        CONSOLE_LOG("- write failed");
+    }
+    file.close();
+}
+
+String getParam(String name)
+{
+    //read parameter from server, for customhmtl input
+    String value;
+    if(wm.server->hasArg(name))
+    {
+        value = wm.server->arg(name);
+    }
+    return value;
+}
+
+void saveParamCallback()
+{
+    CONSOLE_LOG("[CALLBACK] saveParamCallback fired");
+    CONSOLE_LOG("PARAM otherNodeIP = '%s'", getParam("otherNodeIP").c_str());
+    writeFile(LittleFS, cfg_otherNodeIP, getParam("otherNodeIP").c_str());
+}
+
+void configModeCallback(WiFiManager *myWiFiManager)
+{
+    CONSOLE_LOG("Entered config mode, IP = %s, SSID = %s",
+        WiFi.softAPIP().toString().c_str(),
+        myWiFiManager->getConfigPortalSSID().c_str());
+
+    CONSOLE_LOG("HTTP: stop()");
+    http_server_running = false;
+    server.stop();
+}
+
+String getCustomAPName()
+{
+    String hostString = String(WIFI_getChipId(),HEX);
+    hostString.toUpperCase();
+    return "BME280-Weather-" + hostString;
+}
+
 void setupWiFi()
 {
     WiFi.mode(WIFI_STA);
-    WIFI_APS(wifiMulti.addAP);
 
-    CONSOLE_LOG_NO_NL("Connecting to WiFi");
+    wm.setConfigPortalBlocking(false);
+    wm.setAPCallback(configModeCallback);
 
-    // Wait while WifiMulti connects to one of the configured APs
-    while (wifiMulti.run() != WL_CONNECTED)
-    {
-        delay(250);
-        Serial.print(".");
-    }
+    wm.addParameter(&custom_field);
+    wm.setSaveParamsCallback(saveParamCallback);
 
-    Serial.println();
-    // Show the AP where it got connected and the IP assigned
-    CONSOLE_LOG("connected to %s, IP: %s", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    // custom menu via array or vector
+    std::vector<const char *> menu = {"wifi","info","param","sep","restart","exit"};
+    wm.setMenu(menu);
+
+    // set dark theme
+    wm.setClass("invert");
+
+    //set static ip
+    // wm.setSTAStaticIPConfig(IPAddress(10,0,1,99), IPAddress(10,0,1,1), IPAddress(255,255,255,0)); // set static ip,gw,sn
+    // wm.setShowStaticFields(true); // force show static ip fields
+    // wm.setShowDnsFields(true);    // force show dns field always
+
+    // wm.setConnectTimeout(20); // how long to try to connect for before continuing
+    wm.setConfigPortalTimeout(30); // auto close configportal after n seconds
+    // wm.setCaptivePortalEnable(false); // disable captive portal redirection
+    wm.setAPClientCheck(true); // avoid timeout if client connected to softap
+
+    // wifi scan settings
+    // wm.setRemoveDuplicateAPs(false); // do not remove duplicate ap names (true)
+    // wm.setMinimumSignalQuality(20);  // set min RSSI (percentage) to show in scans, null = 8%
+    // wm.setShowInfoErase(false);      // do not show erase button on info page
+    // wm.setScanDispPerc(true);       // show RSSI as percentage not graph icons
+
+    // wm.setBreakAfterConfig(true);   // always exit configportal even if wifi save fails
+
+    wm.autoConnect(getCustomAPName().c_str()); // anonymous ap
 }
 
 void setupOTA()
@@ -175,7 +274,7 @@ void server_on_getData_json(void)
     snprintf(
         buffer,
         buff_len,
-        "{\"temp\": \"%f\",\"hum\": \"%f\", \"pressure\": \"%f\"}",
+        "{\"temp\": \"%f\", \"hum\": \"%f\", \"pressure\": \"%f\"}",
         temperature,
         humidity,
         pressure
@@ -196,13 +295,14 @@ void server_on_getNodeInfo_json(void)
     snprintf(
         buffer,
         buff_len,
-        "{ \"hostname\" : \"%s\", \"local_ip\" : \"%s\", \"uptime\" : \"%lu\", \"sw_build\" : \"%s\", \"ssid\" : \"%s\", \"signal\" : \"%d\"}",
+        "{ \"hostname\" : \"%s\", \"local_ip\" : \"%s\", \"uptime\" : \"%lu\", \"sw_build\" : \"%s\", \"ssid\" : \"%s\", \"signal\" : \"%d\", \"other_ip\": \"%s\"}",
         WiFi.hostname().c_str(),
         WiFi.localIP().toString().c_str(),
         millisecs,
         compile_date,
         WiFi.SSID().c_str(),
-        WiFi.RSSI()
+        WiFi.RSSI(),
+        LittleFS.exists(cfg_otherNodeIP) ? readFile(LittleFS, cfg_otherNodeIP).c_str() : ""
     );
     server.send(
         200,
@@ -222,17 +322,35 @@ void server_on_NotFound(void)
     }
 }
 
+void server_on_reset_Cfg(void)
+{
+    CONSOLE_LOG("Resetting WiFi Manager settings and custom parameters!");
+    wm.resetSettings();
+    if (LittleFS.exists(cfg_otherNodeIP))
+    {
+        LittleFS.remove(cfg_otherNodeIP);
+    }
+
+    server.send(200, "application/json", "{}");
+
+    ESP.restart();
+}
+
 void setupServer()
 {
     // Custom CGI for /getData.json
     server.on("/getData.json", server_on_getData_json);
     // Custom CGI for /getNodeInfo.json
     server.on("/getNodeInfo.json", server_on_getNodeInfo_json);
+    // Custom handler for /resetCfg
+    server.on("/resetCfg", server_on_reset_Cfg);
 
     server.onNotFound(server_on_NotFound);
 
-    server.begin();
-    CONSOLE_LOG("HTTP server started");
+    // Enable cross-site requests
+    server.enableCORS(true);
+
+    CONSOLE_LOG("HTTP server configured");
 }
 
 void setup()
@@ -247,8 +365,8 @@ void setup()
     // Init the BME280
     bme.begin(0x76);
 
-    // Init the SPIFFS
-    SPIFFS.begin();
+    // Init LittleFS
+    LittleFS.begin();
 
     // Configure and connect to WiFi
     setupWiFi();
@@ -264,6 +382,22 @@ void loop()
     ArduinoOTA.handle();
     // Check if there's something to do regarding the HTTP server
     server.handleClient();
-    // Blink the LED at the normal rate
-    blinkIfNeeded(blink_interval_normal);
+    // Give time to the WiFi Manager
+    wm.process();
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        // Blink the LED at the normal rate
+        blinkIfNeeded(blink_interval_normal);
+        if (!http_server_running)
+        {
+            CONSOLE_LOG("HTTP: begin()");
+            server.begin();
+            http_server_running = true;
+        }
+    }
+    else
+    {
+        // Blink the LED at the AP rate
+        blinkIfNeeded(blink_interval_ap);
+    }
 }
